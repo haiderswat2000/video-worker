@@ -1,50 +1,51 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
-from yt_dlp import YoutubeDL
-import os, uuid, asyncio, tempfile, shutil
+# main.py
+import os, uuid, shutil, aiohttp, asyncio
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse
 
-app = FastAPI()
+app = FastAPI(title="Video Worker", version="1.0")
+
 JOBS = {}
 
-class JobIn(BaseModel):
-    url: str
-
-def _build_opts(tmp):
-    return {
-        "outtmpl": f"{tmp}/%(title).80s.%(ext)s",
-        "quiet": True,
-        "noplaylist": True,
-        "max_filesize": 50 * 1024 * 1024,
-        "format": "best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none]",
-    }
-
-async def _run_job(jid, url):
-    JOBS[jid]["status"] = "running"
-    tmp = tempfile.mkdtemp(prefix="ydl_")
+async def _download_video(job_id: str, url: str):
+    """تحميل الفيديو فعلياً"""
+    tmp_dir = f"/tmp/{job_id}"
+    os.makedirs(tmp_dir, exist_ok=True)
+    file_path = os.path.join(tmp_dir, f"{job_id}.mp4")
     try:
-        opts = _build_opts(tmp)
-        def _dl():
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return ydl.prepare_filename(info)
-        loop = asyncio.get_running_loop()
-        path = await loop.run_in_executor(None, _dl)
-        pub = os.path.join("/srv", f"{jid}.mp4")
-        shutil.move(path, pub)
-        base = os.getenv("PUBLIC_BASE_URL", "https://yourappname.onrender.com/files")
-        JOBS[jid].update(status="done", file_url=f"{base}/{jid}.mp4")
+        cmd = [
+            "yt-dlp", "-f", "best[ext=mp4]/best", url,
+            "-o", file_path, "--quiet"
+        ]
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.wait()
+
+        if os.path.exists(file_path):
+            JOBS[job_id]["status"] = "done"
+            JOBS[job_id]["file_url"] = f"{os.getenv('PUBLIC_BASE_URL')}/{job_id}.mp4"
+        else:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = "file not created"
     except Exception as e:
-        JOBS[jid].update(status="error", error=str(e))
+        JOBS[job_id]["status"] = "error"
+        JOBS[job_id]["error"] = str(e)
 
 @app.post("/jobs")
-async def new_job(j: JobIn, bg: BackgroundTasks):
-    jid = uuid.uuid4().hex
-    JOBS[jid] = {"status": "pending"}
-    bg.add_task(_run_job, jid, j.url)
-    return {"job_id": jid, "status": "pending"}
+async def new_job(data: dict, bg: BackgroundTasks):
+    url = data.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="url required")
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {"status": "pending"}
+    bg.add_task(_download_video, job_id, url)
+    return {"job_id": job_id, "status": "pending"}
 
-@app.get("/jobs/{jid}")
-async def get_job(jid: str):
-    if jid not in JOBS:
-        raise HTTPException(404)
-    return JOBS[jid]
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="job not found")
+    return JOBS[job_id]
+
+@app.get("/")
+async def home():
+    return JSONResponse({"ok": True, "message": "Worker running ✅"})
