@@ -7,12 +7,12 @@ import asyncio
 import glob
 import time
 import contextlib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
 
-app = FastAPI(title="Video Worker", version="1.3")
+app = FastAPI(title="Video Worker", version="1.4")
 
 # ===== مسارات ثابتة (بدون متغيرات) =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +22,10 @@ os.makedirs(FILES_DIR, exist_ok=True)
 # ملف كوكيز محلي داخل المستودع (يدعم يوتيوب/إنستغرام معاً)
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
 HAS_COOKIES = os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0
+if HAS_COOKIES:
+    print(f"[worker] cookies.txt detected at: {COOKIES_FILE}")
+else:
+    print("[worker] cookies.txt not found or empty — YouTube may require sign-in")
 
 # رابط عام اختياري (لو ما حطيته، نرجّع روابط نسبية)
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
@@ -34,6 +38,10 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 JOB_TTL_SECONDS = 60 * 60   # ساعة
 CLEAN_INTERVAL = 15 * 60    # كل 15 دقيقة
 
+# رؤوس افتراضية
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+ACCEPT_LANG = "en-US,en;q=0.9,ar;q=0.8"
+
 
 def _now() -> float:
     return time.time()
@@ -44,7 +52,7 @@ def _job_url_for(job_id: str, ext: str) -> str:
     return f"{PUBLIC_BASE_URL}{rel}" if PUBLIC_BASE_URL else rel
 
 
-async def _exec(cmd: list) -> tuple[int, str]:
+async def _exec(cmd: list) -> Tuple[int, str]:
     """
     تشغيل أمر async وجمع stderr (بدون إغراق اللوغز).
     نعيد (returncode, stderr_tail).
@@ -53,7 +61,7 @@ async def _exec(cmd: list) -> tuple[int, str]:
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
     )
     _, err = await proc.communicate()
-    tail = (err or b"")[-2000:].decode("utf-8", "ignore")
+    tail = (err or b"")[-3000:].decode("utf-8", "ignore")
     return proc.returncode, tail
 
 
@@ -82,23 +90,15 @@ def _pick_output(job_id: str) -> Optional[str]:
     return None
 
 
-async def _download_video(job_id: str, url: str):
+def _base_ydl_cmd(outtmpl: str, url: str) -> list:
     """
-    تنزيل فعلي إلى ./files/{job_id}.<ext>
-    نضبط yt-dlp لاستخدام cookies.txt (إن وجد) + player_client للأندرويد ليوتيوب،
-    ونضيف رؤوس UA لتخفيف 429/التحقق.
+    أوامر yt-dlp الأساسية المشتركة بين المحاولة الأولى وخطط التراجع.
     """
-    outtmpl = os.path.join(FILES_DIR, f"{job_id}.%(ext)s")
-
     cmd = [
         "yt-dlp",
         "--no-progress",
         "--no-warnings",
         "-o", outtmpl,
-
-        # اختيارات جودة متوافقة ومُفضِّلة لـ h264 ثم الدقة ثم الامتداد
-        "-S", "codec:h264,res,ext",
-        "-f", "bv*+ba/best",
 
         # الثبات
         "--retries", "3",
@@ -109,24 +109,79 @@ async def _download_video(job_id: str, url: str):
         "--force-ipv4",
 
         # رؤوس/UA
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "--add-header", "Accept-Language: en-US,en;q=0.9,ar;q=0.8",
+        "--user-agent", UA,
+        "--add-header", f"Accept-Language: {ACCEPT_LANG}",
 
-        # يوتيوب: استخدم عميل أندرويد (أخف)، ولاحقًا سيستفيد أيضًا من ملف الكوكيز إن وُجد
-        "--extractor-args", "youtube:player_client=android",
+        # يوتيوب: جرّب عدة عملاء لتجاوز تغييرات YouTube
+        "--extractor-args", "youtube:player_client=android,tv_embedded,ios,web",
 
         url,
     ]
-
     if HAS_COOKIES:
-        # ملف cookies.txt بصيغة Netscape يدعم عدة نطاقات (youtube/instagram/...)
         cmd.extend(["--cookies", COOKIES_FILE])
+    return cmd
 
-    rc, err_tail = await _exec(cmd)
+
+async def _download_video(job_id: str, url: str):
+    """
+    تنزيل فعلي إلى ./files/{job_id}.<ext>
+    نضبط yt-dlp لاستخدام cookies.txt (إن وجد) + عدة player_client ليوتيوب،
+    ونضيف رؤوس UA لتخفيف 429/التحقق. مع خطط fallback ذكية إذا فشلت الصيغة.
+    """
+    outtmpl = os.path.join(FILES_DIR, f"{job_id}.%(ext)s")
+
+    # ---- المحاولة الأولى: تفضيل h264 مع ترتيب دقة/امتداد
+    cmd1 = _base_ydl_cmd(outtmpl, url) + [
+        "-S", "codec:h264,res,ext",
+        "-f", "bv*+ba/best",
+        "--merge-output-format", "mp4",
+    ]
+    rc, err_tail = await _exec(cmd1)
 
     if rc != 0:
-        JOBS[job_id].update(status="error", error=(err_tail or "yt-dlp failed"))
-        return
+        lower = (err_tail or "").lower()
+        # إشارات متوقعة
+        need_sign_in = ("sign in to confirm" in lower) or ("please sign in" in lower)
+        fmt_unavailable = "requested format is not available" in lower
+        rate_limited = ("429" in lower) or ("too many requests" in lower)
+
+        # ---- خطة تراجع 1: إزالة ترتيب -S والاعتماد على bestvideo+bestaudio مع دمج MP4
+        cmd2 = _base_ydl_cmd(outtmpl, url) + [
+            "-f", "bestvideo*+bestaudio/best",
+            "--merge-output-format", "mp4",
+        ]
+        rc2, err2 = await _exec(cmd2)
+
+        if rc2 != 0:
+            lower2 = (err2 or "").lower()
+
+            # ---- خطة تراجع 2: صيغة بسيطة best (قد تنتج webm/mkv)
+            cmd3 = _base_ydl_cmd(outtmpl, url) + [
+                "-f", "best",
+            ]
+            rc3, err3 = await _exec(cmd3)
+
+            if rc3 != 0:
+                lower3 = (err3 or "").lower()
+
+                # ---- خطة تراجع 3 (ملاذ أخير): صوت فقط إن فشل كل شيء
+                cmd4 = _base_ydl_cmd(outtmpl, url) + [
+                    "-f", "bestaudio/best",
+                ]
+                rc4, err4 = await _exec(cmd4)
+
+                if rc4 != 0:
+                    # فشل نهائي — نعطي رسالة أوضح بحسب الحالة
+                    msg = (err4 or err3 or err2 or err_tail or "yt-dlp failed").strip()
+                    if need_sign_in:
+                        msg = "YouTube: Sign-in required or cookies not applied.\n" + msg
+                    elif fmt_unavailable:
+                        msg = "Requested format not available — tried multiple fallbacks.\n" + msg
+                    elif rate_limited:
+                        msg = "Rate limited (429). Try again later.\n" + msg
+
+                    JOBS[job_id].update(status="error", error=msg)
+                    return
 
     out_path = _pick_output(job_id)
     if not out_path:
