@@ -12,14 +12,14 @@ from typing import Dict, Any, Optional, Tuple
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
 
-app = FastAPI(title="Video Worker", version="1.4")
+app = FastAPI(title="Video Worker", version="1.5")
 
-# ===== مسارات ثابتة (بدون متغيرات) =====
+# ===== مسارات ثابتة =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILES_DIR = os.path.join(BASE_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 
-# ملف كوكيز محلي داخل المستودع (يدعم يوتيوب/إنستغرام معاً)
+# cookies.txt (Netscape) بجانب main.py
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
 HAS_COOKIES = os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0
 if HAS_COOKIES:
@@ -27,16 +27,15 @@ if HAS_COOKIES:
 else:
     print("[worker] cookies.txt not found or empty — YouTube may require sign-in")
 
-# رابط عام اختياري (لو ما حطيته، نرجّع روابط نسبية)
+# رابط عام اختياري لإرجاع روابط مطلقة
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 
 # إدارة مهام داخل الذاكرة
-# job_id -> dict(status, file_path?, file_url?, error?, created_at)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-# إعدادات تنظيف
-JOB_TTL_SECONDS = 60 * 60   # ساعة
-CLEAN_INTERVAL = 15 * 60    # كل 15 دقيقة
+# تنظيف
+JOB_TTL_SECONDS = 60 * 60   # 1h
+CLEAN_INTERVAL = 15 * 60    # 15m
 
 # رؤوس افتراضية
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -53,23 +52,17 @@ def _job_url_for(job_id: str, ext: str) -> str:
 
 
 async def _exec(cmd: list) -> Tuple[int, str]:
-    """
-    تشغيل أمر async وجمع stderr (بدون إغراق اللوغز).
-    نعيد (returncode, stderr_tail).
-    """
+    """تشغيل أمر async وإرجاع (rc, tail_of_stderr)."""
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
     )
     _, err = await proc.communicate()
-    tail = (err or b"")[-3000:].decode("utf-8", "ignore")
+    tail = (err or b"")[-4000:].decode("utf-8", "ignore")
     return proc.returncode, tail
 
 
 def _pick_output(job_id: str) -> Optional[str]:
-    """
-    yt-dlp قد يخرج mp4/webm/mkv/m4a… نبحث عن أي امتداد ونرجعه.
-    نعطي أولوية mp4 إن وُجد.
-    """
+    """اختيار أول ملف ناتج صالح، مع تفضيل mp4."""
     base = os.path.join(FILES_DIR, job_id)
     prefs = ("mp4", "mkv", "webm", "m4a", "mp3")
     for ext in prefs:
@@ -80,7 +73,6 @@ def _pick_output(job_id: str) -> Optional[str]:
                     return p
             except Exception:
                 pass
-    # إن لم نجد من اللائحة المفضلة، نلتقط أي ملف يبدأ بـ job_id.
     for p in glob.glob(f"{base}.*"):
         try:
             if os.path.getsize(p) > 0:
@@ -90,14 +82,11 @@ def _pick_output(job_id: str) -> Optional[str]:
     return None
 
 
-def _base_ydl_cmd(outtmpl: str, url: str) -> list:
-    """
-    أوامر yt-dlp الأساسية المشتركة بين المحاولة الأولى وخطط التراجع.
-    """
+def _base_ydl_cmd(outtmpl: str, url: str, player_clients: str) -> list:
+    """أوامر yt-dlp المشتركة + اختيار عميل يوتيوب."""
     cmd = [
         "yt-dlp",
-        "--no-progress",
-        "--no-warnings",
+        "--no-progress", "--no-warnings",
         "-o", outtmpl,
 
         # الثبات
@@ -108,45 +97,45 @@ def _base_ydl_cmd(outtmpl: str, url: str) -> list:
         "--socket-timeout", "30",
         "--force-ipv4",
 
-        # رؤوس/UA
+        # رؤوس
         "--user-agent", UA,
         "--add-header", f"Accept-Language: {ACCEPT_LANG}",
 
-        # يوتيوب: جرّب عدة عملاء لتجاوز تغييرات YouTube
-        "--extractor-args", "youtube:player_client=android,tv_embedded,ios,web",
+        # عميل يوتيوب
+        "--extractor-args", f"youtube:player_client={player_clients}",
 
         url,
     ]
     if HAS_COOKIES:
-        cmd.extend(["--cookies", COOKIES_FILE])
+        cmd += ["--cookies", COOKIES_FILE]
     return cmd
 
 
 async def _download_video(job_id: str, url: str):
     """
     تنزيل فعلي إلى ./files/{job_id}.<ext>
-    نضبط yt-dlp لاستخدام cookies.txt (إن وجد) + عدة player_client ليوتيوب،
-    ونضيف رؤوس UA لتخفيف 429/التحقق. مع خطط fallback ذكية إذا فشلت الصيغة.
+    - مع الكوكيز: نستخدم web/web_embedded لكي تُقبل الكوكيز من YouTube.
+    - بدون كوكيز: نستخدم android,tv_embedded,ios,web.
+    - fallback متعدد للمشاكل الشائعة (format/sign-in/429).
     """
     outtmpl = os.path.join(FILES_DIR, f"{job_id}.%(ext)s")
 
-    # ---- المحاولة الأولى: تفضيل h264 مع ترتيب دقة/امتداد
-    cmd1 = _base_ydl_cmd(outtmpl, url) + [
+    # اختر العملاء حسب وجود الكوكيز
+    clients_primary = "web,web_embedded" if HAS_COOKIES else "android,tv_embedded,ios,web"
+
+    # محاولة 1: تفضيل h264، مع دمج mp4
+    cmd1 = _base_ydl_cmd(outtmpl, url, clients_primary) + [
         "-S", "codec:h264,res,ext",
-        "-f", "bv*+ba/best",
+        "-f", "bestvideo*+bestaudio/best",
         "--merge-output-format", "mp4",
     ]
-    rc, err_tail = await _exec(cmd1)
+    rc1, err1 = await _exec(cmd1)
 
-    if rc != 0:
-        lower = (err_tail or "").lower()
-        # إشارات متوقعة
-        need_sign_in = ("sign in to confirm" in lower) or ("please sign in" in lower)
-        fmt_unavailable = "requested format is not available" in lower
-        rate_limited = ("429" in lower) or ("too many requests" in lower)
+    if rc1 != 0:
+        lower1 = (err1 or "").lower()
 
-        # ---- خطة تراجع 1: إزالة ترتيب -S والاعتماد على bestvideo+bestaudio مع دمج MP4
-        cmd2 = _base_ydl_cmd(outtmpl, url) + [
+        # محاولة 2: إزالة -S والاعتماد على bestvideo+bestaudio
+        cmd2 = _base_ydl_cmd(outtmpl, url, clients_primary) + [
             "-f", "bestvideo*+bestaudio/best",
             "--merge-output-format", "mp4",
         ]
@@ -155,33 +144,43 @@ async def _download_video(job_id: str, url: str):
         if rc2 != 0:
             lower2 = (err2 or "").lower()
 
-            # ---- خطة تراجع 2: صيغة بسيطة best (قد تنتج webm/mkv)
-            cmd3 = _base_ydl_cmd(outtmpl, url) + [
-                "-f", "best",
-            ]
-            rc3, err3 = await _exec(cmd3)
+            # مع الكوكيز: جرّب web فقط (بعض المرات web_embedded يرفض الكوكيز)
+            if HAS_COOKIES:
+                cmd3 = _base_ydl_cmd(outtmpl, url, "web") + [
+                    "-f", "bestvideo*+bestaudio/best",
+                    "--merge-output-format", "mp4",
+                ]
+                rc3, err3 = await _exec(cmd3)
+            else:
+                rc3, err3 = 0, ""
 
             if rc3 != 0:
                 lower3 = (err3 or "").lower()
 
-                # ---- خطة تراجع 3 (ملاذ أخير): صوت فقط إن فشل كل شيء
-                cmd4 = _base_ydl_cmd(outtmpl, url) + [
-                    "-f", "bestaudio/best",
+                # محاولة 4: أبسط صيغة ممكنة
+                cmd4 = _base_ydl_cmd(outtmpl, url, clients_primary) + [
+                    "-f", "best",
                 ]
                 rc4, err4 = await _exec(cmd4)
 
                 if rc4 != 0:
-                    # فشل نهائي — نعطي رسالة أوضح بحسب الحالة
-                    msg = (err4 or err3 or err2 or err_tail or "yt-dlp failed").strip()
-                    if need_sign_in:
-                        msg = "YouTube: Sign-in required or cookies not applied.\n" + msg
-                    elif fmt_unavailable:
-                        msg = "Requested format not available — tried multiple fallbacks.\n" + msg
-                    elif rate_limited:
-                        msg = "Rate limited (429). Try again later.\n" + msg
+                    # محاولة 5: صوت فقط
+                    cmd5 = _base_ydl_cmd(outtmpl, url, clients_primary) + [
+                        "-f", "bestaudio/best",
+                    ]
+                    rc5, err5 = await _exec(cmd5)
 
-                    JOBS[job_id].update(status="error", error=msg)
-                    return
+                    if rc5 != 0:
+                        msg = (err5 or err4 or err3 or err2 or err1 or "yt-dlp failed").strip()
+                        low = msg.lower()
+                        if "sign in to confirm" in low:
+                            msg = "YouTube needs WEB cookies (signin). Verify cookies.txt is fresh & applied.\n" + msg
+                        elif "requested format is not available" in low:
+                            msg = "Requested format not available — all fallbacks tried.\n" + msg
+                        elif "429" in low or "too many requests" in low:
+                            msg = "Rate limited (429). Try again later.\n" + msg
+                        JOBS[job_id].update(status="error", error=msg)
+                        return
 
     out_path = _pick_output(job_id)
     if not out_path:
@@ -238,7 +237,7 @@ async def new_job(data: Dict[str, Any], bg: BackgroundTasks):
     return {"job_id": job_id, "status": "pending"}
 
 
-# ====== الاستعلام عن حالة المهمة (3 مسارات متوافقة) ======
+# ====== الاستعلام عن حالة المهمة ======
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
     job = JOBS.get(job_id)
@@ -255,7 +254,7 @@ async def get_job_status(job_id: str):
     return await get_job(job_id)
 
 
-# ====== تنزيل متزامن مباشر (اختياري للعميل) ======
+# ====== تنزيل مباشر ======
 @app.get("/download")
 async def direct_download(url: str = Query(..., description="Media URL")):
     job_id = uuid.uuid4().hex
@@ -267,12 +266,9 @@ async def direct_download(url: str = Query(..., description="Media URL")):
     return {"file_url": job["file_url"]}
 
 
-# ====== تقديم الملفات الناتجة ======
+# ====== تقديم الملفات ======
 @app.get("/files/{name}")
 async def get_file_by_name(name: str):
-    """
-    مرونة: نسمح بطلب /files/xxxx.mp4 أو /files/xxxx.webm أو غيره.
-    """
     path = os.path.join(FILES_DIR, name)
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="file not found")
