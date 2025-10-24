@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional, Tuple
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
 
-app = FastAPI(title="Video Worker", version="1.5")
+app = FastAPI(title="Video Worker", version="1.6")
 
 # ===== مسارات ثابتة =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,9 +52,16 @@ def _job_url_for(job_id: str, ext: str) -> str:
 
 
 async def _exec(cmd: list) -> Tuple[int, str]:
-    """تشغيل أمر async وإرجاع (rc, tail_of_stderr)."""
+    """تشغيل yt-dlp مع فرض UTF-8 لمنع أخطاء latin-1، وإرجاع (rc, tail_of_stderr)."""
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("LANG", "C.UTF-8")
+    env.setdefault("LC_ALL", "C.UTF-8")
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     _, err = await proc.communicate()
     tail = (err or b"")[-4000:].decode("utf-8", "ignore")
@@ -100,6 +107,7 @@ def _base_ydl_cmd(outtmpl: str, url: str, player_clients: str) -> list:
         # رؤوس
         "--user-agent", UA,
         "--add-header", f"Accept-Language: {ACCEPT_LANG}",
+        "--encoding", "utf-8",  # إجبار إخراج yt-dlp على UTF-8
 
         # عميل يوتيوب
         "--extractor-args", f"youtube:player_client={player_clients}",
@@ -119,8 +127,6 @@ async def _download_video(job_id: str, url: str):
     - fallback متعدد للمشاكل الشائعة (format/sign-in/429).
     """
     outtmpl = os.path.join(FILES_DIR, f"{job_id}.%(ext)s")
-
-    # اختر العملاء حسب وجود الكوكيز
     clients_primary = "web,web_embedded" if HAS_COOKIES else "android,tv_embedded,ios,web"
 
     # محاولة 1: تفضيل h264، مع دمج mp4
@@ -132,8 +138,6 @@ async def _download_video(job_id: str, url: str):
     rc1, err1 = await _exec(cmd1)
 
     if rc1 != 0:
-        lower1 = (err1 or "").lower()
-
         # محاولة 2: إزالة -S والاعتماد على bestvideo+bestaudio
         cmd2 = _base_ydl_cmd(outtmpl, url, clients_primary) + [
             "-f", "bestvideo*+bestaudio/best",
@@ -142,9 +146,7 @@ async def _download_video(job_id: str, url: str):
         rc2, err2 = await _exec(cmd2)
 
         if rc2 != 0:
-            lower2 = (err2 or "").lower()
-
-            # مع الكوكيز: جرّب web فقط (بعض المرات web_embedded يرفض الكوكيز)
+            # مع الكوكيز: جرّب web فقط (أحيانًا web_embedded يرفض)
             if HAS_COOKIES:
                 cmd3 = _base_ydl_cmd(outtmpl, url, "web") + [
                     "-f", "bestvideo*+bestaudio/best",
@@ -155,19 +157,13 @@ async def _download_video(job_id: str, url: str):
                 rc3, err3 = 0, ""
 
             if rc3 != 0:
-                lower3 = (err3 or "").lower()
-
                 # محاولة 4: أبسط صيغة ممكنة
-                cmd4 = _base_ydl_cmd(outtmpl, url, clients_primary) + [
-                    "-f", "best",
-                ]
+                cmd4 = _base_ydl_cmd(outtmpl, url, clients_primary) + ["-f", "best"]
                 rc4, err4 = await _exec(cmd4)
 
                 if rc4 != 0:
                     # محاولة 5: صوت فقط
-                    cmd5 = _base_ydl_cmd(outtmpl, url, clients_primary) + [
-                        "-f", "bestaudio/best",
-                    ]
+                    cmd5 = _base_ydl_cmd(outtmpl, url, clients_primary) + ["-f", "bestaudio/best"]
                     rc5, err5 = await _exec(cmd5)
 
                     if rc5 != 0:
@@ -177,6 +173,8 @@ async def _download_video(job_id: str, url: str):
                             msg = "YouTube needs WEB cookies (signin). Verify cookies.txt is fresh & applied.\n" + msg
                         elif "requested format is not available" in low:
                             msg = "Requested format not available — all fallbacks tried.\n" + msg
+                        elif "latin-1" in low:
+                            msg = "Encoding issue fixed by forcing UTF-8; please restart worker.\n" + msg
                         elif "429" in low or "too many requests" in low:
                             msg = "Rate limited (429). Try again later.\n" + msg
                         JOBS[job_id].update(status="error", error=msg)
@@ -196,7 +194,6 @@ async def _download_video(job_id: str, url: str):
 
 
 async def _cleaner_loop():
-    """حذف المهام/الملفات الأقدم من JOB_TTL_SECONDS كل CLEAN_INTERVAL."""
     while True:
         try:
             cutoff = _now() - JOB_TTL_SECONDS
