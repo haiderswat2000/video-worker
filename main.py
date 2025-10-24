@@ -6,32 +6,33 @@ import uuid
 import asyncio
 import glob
 import time
+import contextlib
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.responses import JSONResponse, FileResponse
 
-app = FastAPI(title="Video Worker", version="1.2")
+app = FastAPI(title="Video Worker", version="1.3")
 
-# ==== مسارات ثابتة (بدون متغيرات) ====
+# ===== مسارات ثابتة (بدون متغيرات) =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILES_DIR = os.path.join(BASE_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 
-# ملف كوكيز محلي داخل المستودع لدعم يوتيوب
+# ملف كوكيز محلي داخل المستودع (يدعم يوتيوب/إنستغرام معاً)
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
 HAS_COOKIES = os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0
 
-# روابط عامة (اختياري) — إن لم توفّر، سنعيد روابط نسبية
+# رابط عام اختياري (لو ما حطيته، نرجّع روابط نسبية)
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 
-# إدارة مهام بسيطة داخل الذاكرة
+# إدارة مهام داخل الذاكرة
 # job_id -> dict(status, file_path?, file_url?, error?, created_at)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-# إعدادات تنظيف دوري
-JOB_TTL_SECONDS = 60 * 60  # ساعة
-CLEAN_INTERVAL = 15 * 60   # كل 15 دقيقة
+# إعدادات تنظيف
+JOB_TTL_SECONDS = 60 * 60   # ساعة
+CLEAN_INTERVAL = 15 * 60    # كل 15 دقيقة
 
 
 def _now() -> float:
@@ -49,9 +50,7 @@ async def _exec(cmd: list) -> tuple[int, str]:
     نعيد (returncode, stderr_tail).
     """
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
     )
     _, err = await proc.communicate()
     tail = (err or b"")[-2000:].decode("utf-8", "ignore")
@@ -67,11 +66,14 @@ def _pick_output(job_id: str) -> Optional[str]:
     prefs = ("mp4", "mkv", "webm", "m4a", "mp3")
     for ext in prefs:
         p = f"{base}.{ext}"
-        if os.path.exists(p) and os.path.getsize(p) > 0:
-            return p
+        if os.path.exists(p):
+            try:
+                if os.path.getsize(p) > 0:
+                    return p
+            except Exception:
+                pass
     # إن لم نجد من اللائحة المفضلة، نلتقط أي ملف يبدأ بـ job_id.
-    matches = glob.glob(f"{base}.*")
-    for p in matches:
+    for p in glob.glob(f"{base}.*"):
         try:
             if os.path.getsize(p) > 0:
                 return p
@@ -83,9 +85,9 @@ def _pick_output(job_id: str) -> Optional[str]:
 async def _download_video(job_id: str, url: str):
     """
     تنزيل فعلي إلى ./files/{job_id}.<ext>
-    نضبط yt-dlp لاستخدام cookies.txt (إن وجد) + player_client للأندرويد ليوتيوب.
+    نضبط yt-dlp لاستخدام cookies.txt (إن وجد) + player_client للأندرويد ليوتيوب،
+    ونضيف رؤوس UA لتخفيف 429/التحقق.
     """
-    # نستخدم قالب اسم الإخراج فوق مجلد files
     outtmpl = os.path.join(FILES_DIR, f"{job_id}.%(ext)s")
 
     cmd = [
@@ -93,17 +95,31 @@ async def _download_video(job_id: str, url: str):
         "--no-progress",
         "--no-warnings",
         "-o", outtmpl,
-        # اختيارات جودة جيدة/متوافقة
-        "-S", "codec:h264,res,ext",           # فضّل h264 ثم الدقة ثم الامتداد
-        "-f", "bv*+ba/best",                  # فيديو+صوت أو أفضل متاح
+
+        # اختيارات جودة متوافقة ومُفضِّلة لـ h264 ثم الدقة ثم الامتداد
+        "-S", "codec:h264,res,ext",
+        "-f", "bv*+ba/best",
+
+        # الثبات
         "--retries", "3",
         "--fragment-retries", "10",
+        "--retry-sleep", "3",
+        "--sleep-requests", "1",
         "--socket-timeout", "30",
+        "--force-ipv4",
+
+        # رؤوس/UA
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "--add-header", "Accept-Language: en-US,en;q=0.9,ar;q=0.8",
+
+        # يوتيوب: استخدم عميل أندرويد (أخف)، ولاحقًا سيستفيد أيضًا من ملف الكوكيز إن وُجد
         "--extractor-args", "youtube:player_client=android",
+
         url,
     ]
+
     if HAS_COOKIES:
-        cmd[0:0] = []  # لا شيء — للوضوح فقط
+        # ملف cookies.txt بصيغة Netscape يدعم عدة نطاقات (youtube/instagram/...)
         cmd.extend(["--cookies", COOKIES_FILE])
 
     rc, err_tail = await _exec(cmd)
@@ -112,7 +128,6 @@ async def _download_video(job_id: str, url: str):
         JOBS[job_id].update(status="error", error=(err_tail or "yt-dlp failed"))
         return
 
-    # التقط الملف الناتج الحقيقي
     out_path = _pick_output(job_id)
     if not out_path:
         JOBS[job_id].update(status="error", error="file not created")
@@ -148,7 +163,6 @@ async def _cleaner_loop():
 
 @app.on_event("startup")
 async def _on_start():
-    # شغّل منظِّف الخلفية
     asyncio.create_task(_cleaner_loop())
 
 
@@ -157,33 +171,38 @@ async def home():
     return JSONResponse({"ok": True, "message": "Worker running ✅"})
 
 
+# ====== إنشاء مهمة ======
 @app.post("/jobs")
 async def new_job(data: Dict[str, Any], bg: BackgroundTasks):
     url = (data or {}).get("url")
     if not url:
         raise HTTPException(status_code=400, detail="url required")
-
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"status": "pending", "created_at": _now()}
     bg.add_task(_download_video, job_id, url)
     return {"job_id": job_id, "status": "pending"}
 
 
+# ====== الاستعلام عن حالة المهمة (3 مسارات متوافقة) ======
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    # لا نعرض المسار الداخلي في الـAPI العام
-    public = {k: v for k, v in job.items() if k != "file_path"}
-    return public
+    return {k: v for k, v in job.items() if k != "file_path"}
+
+@app.get("/api/jobs/{job_id}")
+async def get_job_api(job_id: str):
+    return await get_job(job_id)
+
+@app.get("/status/{job_id}")
+async def get_job_status(job_id: str):
+    return await get_job(job_id)
 
 
+# ====== تنزيل متزامن مباشر (اختياري للعميل) ======
 @app.get("/download")
 async def direct_download(url: str = Query(..., description="Media URL")):
-    """
-    تنزيل متزامن (يُفيد زبونك عندما يحاول أولاً /download ثم يسقط إلى /jobs).
-    """
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"status": "running", "created_at": _now()}
     await _download_video(job_id, url)
@@ -193,10 +212,11 @@ async def direct_download(url: str = Query(..., description="Media URL")):
     return {"file_url": job["file_url"]}
 
 
+# ====== تقديم الملفات الناتجة ======
 @app.get("/files/{name}")
 async def get_file_by_name(name: str):
     """
-    مرونة: نسمح بطلب /files/xxxx.mp4 أو /files/xxxx.webm
+    مرونة: نسمح بطلب /files/xxxx.mp4 أو /files/xxxx.webm أو غيره.
     """
     path = os.path.join(FILES_DIR, name)
     if not os.path.isfile(path):
@@ -214,14 +234,12 @@ async def get_file_by_name(name: str):
     return FileResponse(path, filename=name, media_type=media)
 
 
-# تَوافق مع مسارك السابق: /files/{job_id}.mp4
+# توافق: /files/{job_id}.mp4 حتى لو الامتداد الحقيقي ليس mp4
 @app.get("/files/{job_id}.mp4")
 async def get_mp4(job_id: str):
-    # إن لم يكن mp4 موجودًا، حاول أي امتداد ثم أعده كتحميل
     p = os.path.join(FILES_DIR, f"{job_id}.mp4")
     if os.path.isfile(p):
         return FileResponse(p, filename=f"{job_id}.mp4", media_type="video/mp4")
-
     alt = _pick_output(job_id)
     if not alt:
         raise HTTPException(status_code=404, detail="file not ready")
