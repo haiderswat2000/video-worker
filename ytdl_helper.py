@@ -8,10 +8,16 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 from yt_dlp import YoutubeDL
 
-UA = (
+# وكلاء مستخدم: ويب + iOS (سنستخدم iOS ليوتيوب)
+UA_WEB = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
+)
+UA_IOS = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
 CANDIDATE_YT_COOKIES: List[Path] = [Path("./cookies/youtube.txt"), Path("./youtube.txt")]
@@ -33,7 +39,8 @@ def _sanitize(s: str) -> str:
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
-def _parse_netscape(text: str) -> List[tuple]:
+# ---------- توليد كوكيز Netscape موسّعة (يوتيوب + جوجل) ----------
+def _parse_netscape_lines(text: str) -> List[tuple]:
     rows = []
     for line in text.splitlines():
         if not line or line.startswith("#"):
@@ -44,14 +51,20 @@ def _parse_netscape(text: str) -> List[tuple]:
             rows.append((domain.lstrip("#"), flag, path, secure, expires, name, value))
     return rows
 
-def _write_netscape(rows: List[tuple], dest: Path) -> None:
+def _write_netscape_file(rows: List[tuple], dest: Path) -> None:
     header = ["# Netscape HTTP Cookie File", "# Generated/merged by worker", ""]
     body = ["\t".join([d, f, p, s, str(e), n, v]) for (d, f, p, s, e, n, v) in rows]
     dest.write_text("\n".join(header + body), encoding="utf-8")
 
 def _ensure_consent_and_google_mirror(orig: Path) -> str:
+    """
+    يقرأ youtube.txt ويُنتج ملفًا مؤقتًا:
+      - يزيل '#HttpOnly_' إن وُجدت
+      - يضيف CONSENT=YES+ إن كانت مفقودة
+      - ينسخ كل الكوكيز أيضًا إلى .google.com
+    """
     txt = orig.read_text(encoding="utf-8", errors="ignore")
-    rows = _parse_netscape(txt)
+    rows = _parse_netscape_lines(txt)
     have_consent = any(r[5] == "CONSENT" for r in rows)
 
     merged: List[tuple] = []
@@ -65,58 +78,28 @@ def _ensure_consent_and_google_mirror(orig: Path) -> str:
             merged.append((dom, "TRUE", "/", "TRUE", "4102444800", "CONSENT", "YES+"))
 
     tmp = Path(tempfile.gettempdir()) / f"yt_cookies_merged_{os.getpid()}.txt"
-    _write_netscape(merged, tmp)
+    _write_netscape_file(merged, tmp)
     return str(tmp)
 
-def _cookie_header_from_file(orig: Path) -> str:
-    """
-    يبني Cookie header من ملف Netscape (نأخذ آخر قيمة لكل اسم).
-    نُخرج قيمة موحّدة صالحة لطلبات youtube/google.
-    """
-    txt = orig.read_text(encoding="utf-8", errors="ignore")
-    rows = _parse_netscape(txt)
-    kv: Dict[str, str] = {}
-    for (_domain, _flag, _path, _secure, _exp, name, value) in rows:
-        if name and value:
-            kv[name] = value
-    if "CONSENT" not in kv:
-        kv["CONSENT"] = "YES+"
-    # ترتيب بسيط لبعض المفاتيح المهمة أولاً (غير إلزامي)
-    order_hint = [
-        "__Secure-1PSID", "__Secure-3PSID", "SID", "SAPISID", "APISID", "HSID", "SSID",
-        "__Secure-1PAPISID", "__Secure-3PAPISID", "LOGIN_INFO", "VISITOR_INFO1_LIVE",
-        "YSC", "PREF", "GPS", "CONSENT"
-    ]
-    parts: List[str] = []
-    seen = set()
-    for k in order_hint:
-        if k in kv:
-            parts.append(f"{k}={kv[k]}")
-            seen.add(k)
-    for k, v in kv.items():
-        if k not in seen:
-            parts.append(f"{k}={v}")
-    return "; ".join(parts)
-
-def _common_headers(cookie_header: Optional[str] = None) -> Dict[str, str]:
-    h = {
-        "User-Agent": UA,
+def _http_headers(use_ios: bool) -> Dict[str, str]:
+    return {
+        "User-Agent": UA_IOS if use_ios else UA_WEB,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        "Sec-Fetch-Mode": "navigate",
         "Referer": "https://www.youtube.com/",
     }
-    if cookie_header:
-        h["Cookie"] = cookie_header
-    return h
 
+# ---------- إعدادات yt-dlp ----------
 def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[str, Any]:
-    # تجهيز الكوكيز (cookiefile + Header Cookie)
+    # سنستخدم عميل iOS ليوتيوب (مع UA iPhone)
+    use_ios = _is_youtube(url_for_cookies)
+
     cookiefile_path: Optional[str] = None
-    cookie_header: Optional[str] = None
-    if _is_youtube(url_for_cookies):
+    if use_ios:
         src = _pick_cookiefile()
         if src:
             cookiefile_path = _ensure_consent_and_google_mirror(src)
-            cookie_header = _cookie_header_from_file(src)
 
     base: Dict[str, Any] = {
         "outtmpl": outtmpl,
@@ -126,7 +109,7 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
         "retries": 3,
         "fragment_retries": 10,
         "socket_timeout": 30,
-        "http_headers": _common_headers(cookie_header),
+        "http_headers": _http_headers(use_ios),
         "progress_hooks": [progress_hook],
         "concurrent_fragment_downloads": 4,
         "geo_bypass": True,
@@ -137,9 +120,9 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
             "codec:h264", "acodec:aac",
             "ext:mp4", "proto:https", "hasaud",
         ],
-        # 🟢 اجعل عميل Android أولاً ثم web — هذا يتجاوز كثيرًا من فحوصات البوت
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        "verbose": True,  # لتأكيد في اللوج أن cookiefile يُستخدم
+        # 🟢 جرّب iOS ثم Android ثم Web
+        "extractor_args": {"youtube": {"player_client": ["ios", "android", "web"]}},
+        "verbose": True,
     }
     if cookiefile_path:
         base["cookiefile"] = cookiefile_path
@@ -186,10 +169,11 @@ def _pick_best_muxed(info: Dict[str, Any]) -> Optional[str]:
     best_f, _ = sorted(cand, key=score, reverse=True)[0]
     return best_f.get("format_id")
 
+# ---------- التنزيل ----------
 def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
     """
     يحاول أولاً صيغة مدمجة جاهزة، ثم fallback مرن، ثم دمج عبر FFmpeg إن كان متاحًا.
-    نمرّر الكوكيز كـ cookiefile + Header لتجاوز 'Sign in to confirm'.
+    نستخدم عميل iOS + UA iPhone ليوتيوب لتجاوز حواجز 'not a bot'.
     """
     os.makedirs(out_dir, exist_ok=True)
     tmp_out = os.path.join(out_dir, "%(title).100s.%(ext)s")
