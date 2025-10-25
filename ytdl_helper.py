@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 from yt_dlp import YoutubeDL
 
-# وكلاء مستخدم: ويب + iOS (سنستخدم iOS ليوتيوب)
+# وكلاء مستخدم: ويب + iOS (سنستخدم iOS ليوتيوب افتراضياً)
 UA_WEB = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -92,7 +92,7 @@ def _http_headers(use_ios: bool) -> Dict[str, str]:
 
 # ---------- إعدادات yt-dlp ----------
 def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[str, Any]:
-    # سنستخدم عميل iOS ليوتيوب (مع UA iPhone)
+    # نستخدم iOS ليوتيوب (مع UA iPhone)
     use_ios = _is_youtube(url_for_cookies)
 
     cookiefile_path: Optional[str] = None
@@ -121,7 +121,13 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
             "ext:mp4", "proto:https", "hasaud",
         ],
         # 🟢 جرّب iOS ثم Android ثم Web
-        "extractor_args": {"youtube": {"player_client": ["ios", "android", "web"]}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android", "web"],
+                # اجبر تضمين DASH manifest لأن بعض المقاطع لا تُظهر الصيغ إلا عبره
+                "include_dash_manifest": ["True"],
+            }
+        },
         "verbose": True,
     }
     if cookiefile_path:
@@ -130,6 +136,7 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
 
 def probe_info(url: str, base_opts: Dict[str, Any]) -> Dict[str, Any]:
     opts = dict(base_opts)
+    # نزيل أي format لنسمح لليدلة أن تُرجع جميع الصيغ
     opts.pop("format", None)
     opts.pop("merge_output_format", None)
     with YoutubeDL(opts) as ydl:
@@ -172,8 +179,8 @@ def _pick_best_muxed(info: Dict[str, Any]) -> Optional[str]:
 # ---------- التنزيل ----------
 def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
     """
-    يحاول أولاً صيغة مدمجة جاهزة، ثم fallback مرن، ثم دمج عبر FFmpeg إن كان متاحًا.
-    نستخدم عميل iOS + UA iPhone ليوتيوب لتجاوز حواجز 'not a bot'.
+    يحاول أولاً ترك yt-dlp يختار تلقائياً (بدون format)، ثم:
+    format_id المدمج -> سلسلة مرنة -> دمج عبر FFmpeg -> best.
     """
     os.makedirs(out_dir, exist_ok=True)
     tmp_out = os.path.join(out_dir, "%(title).100s.%(ext)s")
@@ -185,19 +192,29 @@ def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
 
     try_order: List[Dict[str, Any]] = []
 
+    # 0) اترك yt-dlp يختار تلقائياً (أحياناً يحلّ "Requested format is not available")
+    o0 = dict(base_opts)
+    o0.pop("format", None)
+    o0.pop("merge_output_format", None)
+    try_order.append(o0)
+
+    # 1) format_id المدمج إن وُجد
     if fmt_id:
         o1 = dict(base_opts); o1["format"] = fmt_id
         try_order.append(o1)
 
+    # 2) سلسلة بدون دمج: أي صيغة فيها صوت
     o2 = dict(base_opts); o2["format"] = "best[hasaudio=true][ext=mp4]/best[hasaudio=true]/best"
     try_order.append(o2)
 
+    # 3) مع FFmpeg: دمج أفضل فيديو+صوت وإخراج mp4
     if ff_ok:
         o3 = dict(base_opts)
         o3["format"] = "bestvideo*+bestaudio/best"
         o3["merge_output_format"] = "mp4"
         try_order.append(o3)
 
+    # 4) أخيرًا: best
     o4 = dict(base_opts); o4["format"] = "best"
     try_order.append(o4)
 
