@@ -14,7 +14,6 @@ UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# أين نبحث عن ملف كوكيز يوتيوب
 CANDIDATE_YT_COOKIES: List[Path] = [Path("./cookies/youtube.txt"), Path("./youtube.txt")]
 
 def _pick_cookiefile() -> Optional[Path]:
@@ -27,13 +26,6 @@ def _is_youtube(url: str) -> bool:
     u = (url or "").lower()
     return ("youtube.com" in u) or ("youtu.be" in u)
 
-def _common_headers() -> Dict[str, str]:
-    return {
-        "User-Agent": UA,
-        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-        "Referer": "https://www.youtube.com/",
-    }
-
 def _sanitize(s: str) -> str:
     s = re.sub(r'[\\/:*?"<>|\n\r\t]+', "_", (s or "video")).strip()
     return s or "video"
@@ -41,8 +33,7 @@ def _sanitize(s: str) -> str:
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
-# ---------- توليد كوكيز Netscape موسّعة (يوتيوب + جوجل) ----------
-def _parse_netscape_lines(text: str) -> List[tuple]:
+def _parse_netscape(text: str) -> List[tuple]:
     rows = []
     for line in text.splitlines():
         if not line or line.startswith("#"):
@@ -50,51 +41,83 @@ def _parse_netscape_lines(text: str) -> List[tuple]:
         parts = line.split("\t")
         if len(parts) >= 7:
             domain, flag, path, secure, expires, name, value = parts[:7]
-            rows.append((domain, flag, path, secure, expires, name, value))
+            rows.append((domain.lstrip("#"), flag, path, secure, expires, name, value))
     return rows
 
-def _write_netscape_file(rows: List[tuple], dest: Path) -> None:
-    header = [
-        "# Netscape HTTP Cookie File",
-        "# Generated/merged by worker",
-        ""
-    ]
-    lines = ["\t".join([domain, flag, path, secure, str(expires), name, value])
-             for (domain, flag, path, secure, expires, name, value) in rows]
-    dest.write_text("\n".join(header + lines), encoding="utf-8")
+def _write_netscape(rows: List[tuple], dest: Path) -> None:
+    header = ["# Netscape HTTP Cookie File", "# Generated/merged by worker", ""]
+    body = ["\t".join([d, f, p, s, str(e), n, v]) for (d, f, p, s, e, n, v) in rows]
+    dest.write_text("\n".join(header + body), encoding="utf-8")
 
 def _ensure_consent_and_google_mirror(orig: Path) -> str:
-    """
-    يقرأ youtube.txt ويُنتج ملفاً مؤقتاً:
-      - يزيل بادئة '#HttpOnly_' من الدومين إن وجدت
-      - يضيف CONSENT=YES+ إن لم توجد
-      - يضاعف كل كوكيز إلى .google.com بالإضافة إلى .youtube.com
-    """
     txt = orig.read_text(encoding="utf-8", errors="ignore")
-    rows = _parse_netscape_lines(txt)
-
-    # كشف وجود CONSENT
-    have_consent = any((row[5] == "CONSENT") for row in rows)
+    rows = _parse_netscape(txt)
+    have_consent = any(r[5] == "CONSENT" for r in rows)
 
     merged: List[tuple] = []
     for (domain, flag, path, secure, expires, name, value) in rows:
-        domain = domain.lstrip("#")  # معالجة '#HttpOnly_.youtube.com'
         merged.append((domain, flag, path, secure, expires, name, value))
-        # مضاعفة لأي كوكي إلى google.com إذا كان من youtube.com (يشمل HttpOnly السابق)
         if "youtube.com" in domain:
             merged.append((".google.com", "TRUE", "/", "TRUE", expires, name, value))
 
     if not have_consent:
-        # صلاحية طويلة (4102444800 ≈ 2099-12-31)
         for dom in (".youtube.com", ".google.com"):
             merged.append((dom, "TRUE", "/", "TRUE", "4102444800", "CONSENT", "YES+"))
 
     tmp = Path(tempfile.gettempdir()) / f"yt_cookies_merged_{os.getpid()}.txt"
-    _write_netscape_file(merged, tmp)
+    _write_netscape(merged, tmp)
     return str(tmp)
 
-# ---------- إعدادات yt-dlp ----------
+def _cookie_header_from_file(orig: Path) -> str:
+    """
+    يبني Cookie header من ملف Netscape (نأخذ آخر قيمة لكل اسم).
+    نُخرج قيمة موحّدة صالحة لطلبات youtube/google.
+    """
+    txt = orig.read_text(encoding="utf-8", errors="ignore")
+    rows = _parse_netscape(txt)
+    kv: Dict[str, str] = {}
+    for (_domain, _flag, _path, _secure, _exp, name, value) in rows:
+        if name and value:
+            kv[name] = value
+    if "CONSENT" not in kv:
+        kv["CONSENT"] = "YES+"
+    # ترتيب بسيط لبعض المفاتيح المهمة أولاً (غير إلزامي)
+    order_hint = [
+        "__Secure-1PSID", "__Secure-3PSID", "SID", "SAPISID", "APISID", "HSID", "SSID",
+        "__Secure-1PAPISID", "__Secure-3PAPISID", "LOGIN_INFO", "VISITOR_INFO1_LIVE",
+        "YSC", "PREF", "GPS", "CONSENT"
+    ]
+    parts: List[str] = []
+    seen = set()
+    for k in order_hint:
+        if k in kv:
+            parts.append(f"{k}={kv[k]}")
+            seen.add(k)
+    for k, v in kv.items():
+        if k not in seen:
+            parts.append(f"{k}={v}")
+    return "; ".join(parts)
+
+def _common_headers(cookie_header: Optional[str] = None) -> Dict[str, str]:
+    h = {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        "Referer": "https://www.youtube.com/",
+    }
+    if cookie_header:
+        h["Cookie"] = cookie_header
+    return h
+
 def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[str, Any]:
+    # تجهيز الكوكيز (cookiefile + Header Cookie)
+    cookiefile_path: Optional[str] = None
+    cookie_header: Optional[str] = None
+    if _is_youtube(url_for_cookies):
+        src = _pick_cookiefile()
+        if src:
+            cookiefile_path = _ensure_consent_and_google_mirror(src)
+            cookie_header = _cookie_header_from_file(src)
+
     base: Dict[str, Any] = {
         "outtmpl": outtmpl,
         "quiet": True,
@@ -103,7 +126,7 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
         "retries": 3,
         "fragment_retries": 10,
         "socket_timeout": 30,
-        "http_headers": _common_headers(),
+        "http_headers": _common_headers(cookie_header),
         "progress_hooks": [progress_hook],
         "concurrent_fragment_downloads": 4,
         "geo_bypass": True,
@@ -114,15 +137,12 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
             "codec:h264", "acodec:aac",
             "ext:mp4", "proto:https", "hasaud",
         ],
-        "extractor_args": {"youtube": {"player_client": ["web"]}},
+        # 🟢 اجعل عميل Android أولاً ثم web — هذا يتجاوز كثيرًا من فحوصات البوت
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "verbose": True,  # لتأكيد في اللوج أن cookiefile يُستخدم
     }
-
-    # تفعيل الكوكيز ليوتيوب فقط
-    if _is_youtube(url_for_cookies):
-        src = _pick_cookiefile()
-        if src:
-            base["cookiefile"] = _ensure_consent_and_google_mirror(src)
-
+    if cookiefile_path:
+        base["cookiefile"] = cookiefile_path
     return base
 
 def probe_info(url: str, base_opts: Dict[str, Any]) -> Dict[str, Any]:
@@ -136,9 +156,6 @@ def probe_info(url: str, base_opts: Dict[str, Any]) -> Dict[str, Any]:
     return info or {}
 
 def _pick_best_muxed(info: Dict[str, Any]) -> Optional[str]:
-    """
-    اختيار أفضل صيغة 'muxed' (صوت+فيديو معًا) ويفضّل MP4 ويتجنب HLS.
-    """
     fmts: List[Dict[str, Any]] = info.get("formats") or []
 
     def is_muxed(f: Dict[str, Any]) -> bool:
@@ -169,11 +186,10 @@ def _pick_best_muxed(info: Dict[str, Any]) -> Optional[str]:
     best_f, _ = sorted(cand, key=score, reverse=True)[0]
     return best_f.get("format_id")
 
-# ---------- التنزيل ----------
 def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
     """
-    يحاول أولاً صيغة مدمجة جاهزة، ثم سلاسل fallback، ثم الدمج عبر FFmpeg إن كان متوفراً.
-    كما يدمج/يكمّل الكوكيز تلقائياً لتخطي "Sign in to confirm".
+    يحاول أولاً صيغة مدمجة جاهزة، ثم fallback مرن، ثم دمج عبر FFmpeg إن كان متاحًا.
+    نمرّر الكوكيز كـ cookiefile + Header لتجاوز 'Sign in to confirm'.
     """
     os.makedirs(out_dir, exist_ok=True)
     tmp_out = os.path.join(out_dir, "%(title).100s.%(ext)s")
@@ -185,27 +201,20 @@ def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
 
     try_order: List[Dict[str, Any]] = []
 
-    # 1) format_id المدمج إن وجد
     if fmt_id:
-        o1 = dict(base_opts)
-        o1["format"] = fmt_id
+        o1 = dict(base_opts); o1["format"] = fmt_id
         try_order.append(o1)
 
-    # 2) بدون دمج: أي صيغة فيها صوت
-    o2 = dict(base_opts)
-    o2["format"] = "best[hasaudio=true][ext=mp4]/best[hasaudio=true]/best"
+    o2 = dict(base_opts); o2["format"] = "best[hasaudio=true][ext=mp4]/best[hasaudio=true]/best"
     try_order.append(o2)
 
-    # 3) مع FFmpeg: دمج أفضل فيديو+صوت وإخراج mp4
     if ff_ok:
         o3 = dict(base_opts)
         o3["format"] = "bestvideo*+bestaudio/best"
         o3["merge_output_format"] = "mp4"
         try_order.append(o3)
 
-    # 4) أخيرًا: best
-    o4 = dict(base_opts)
-    o4["format"] = "best"
+    o4 = dict(base_opts); o4["format"] = "best"
     try_order.append(o4)
 
     last_exc: Optional[Exception] = None
@@ -225,7 +234,6 @@ def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
     if not final_path:
         raise last_exc or RuntimeError("failed to download")
 
-    # فرض اسم نظيف .mp4 (حتى لو خرج webm)
     base_name = _sanitize(os.path.splitext(os.path.basename(final_path))[0]) + ".mp4"
     dest = os.path.join(out_dir, base_name)
     if os.path.abspath(final_path) != os.path.abspath(dest):
