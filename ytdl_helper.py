@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
-import os, re, asyncio, tempfile
-from typing import Dict, Any, Tuple, Optional, List
+import os, re
+from typing import Dict, Any, Tuple
 from yt_dlp import YoutubeDL
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -9,7 +8,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 def _common_headers() -> Dict[str, str]:
     return {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,ar;q=0.8"}
 
-def _sanitize_name(s: str) -> str:
+def _sanitize(s: str) -> str:
     return re.sub(r'[\\/:*?"<>|\n\r\t]+', "_", (s or "video")).strip() or "video"
 
 def build_opts(outtmpl: str, progress_hook):
@@ -41,15 +40,13 @@ def probe_info(url: str, base_opts: Dict[str, Any]) -> Dict[str, Any]:
 
 def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
     tmp_out = os.path.join(out_dir, "%(title).100s.%(ext)s")
-    progress_hook = lambda _p: None
-    opts = build_opts(tmp_out, progress_hook)
-    info = probe_info(url, opts)
-
+    opts = build_opts(tmp_out, lambda _p: None)
     with YoutubeDL(opts) as ydl:
         info2 = ydl.extract_info(url, download=True)
         final_path = ydl.prepare_filename(info2)
-        base = os.path.basename(final_path)
-        safe = _sanitize_name(os.path.splitext(base)[0]) + ".mp4"
-        if final_path != os.path.join(out_dir, safe):
-            os.replace(final_path, os.path.join(out_dir, safe))
-        return os.path.join(out_dir, safe), info2
+    base = os.path.basename(final_path)
+    safe = _sanitize(os.path.splitext(base)[0]) + ".mp4"
+    dest = os.path.join(out_dir, safe)
+    if final_path != dest:
+        os.replace(final_path, dest)
+    return dest, info2
