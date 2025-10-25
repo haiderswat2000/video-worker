@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 import uuid, time, asyncio, os
 from pathlib import Path
@@ -17,11 +16,10 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
-# حالة الوظائف
 class Job(BaseModel):
     id: str
     url: str
-    status: str = "queued"      # queued | running | done | error
+    status: str = "queued"
     file_path: Optional[str] = None
     error: Optional[str] = None
     created_at: float = time.time()
@@ -52,12 +50,10 @@ async def healthz():
 
 @app.get("/download")
 async def sync_download(url: str):
-    # تنزيل متزامن سريع (للروابط السهلة)
-    jid = str(uuid.uuid4().hex)
+    jid = uuid.uuid4().hex
     JOBS[jid] = Job(id=jid, url=url, status="running")
     try:
-        out_dir = str(STORAGE_DIR / jid)
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir = str(STORAGE_DIR / jid); os.makedirs(out_dir, exist_ok=True)
         file_path, _ = await asyncio.to_thread(ydl_download, url, out_dir)
         JOBS[jid].status = "done"; JOBS[jid].file_path = file_path; JOBS[jid].done_at = time.time()
         return {"job_id": jid, "status": "done", "file": f"/files/{jid}"}
@@ -65,13 +61,13 @@ async def sync_download(url: str):
         JOBS[jid].status = "error"; JOBS[jid].error = str(e); JOBS[jid].done_at = time.time()
         raise HTTPException(400, str(e))
 
-class CreateJob(BaseModel):
-    url: str
-
 @app.post("/jobs")
-async def create_job(req: CreateJob, bg: BackgroundTasks):
-    jid = str(uuid.uuid4().hex)
-    JOBS[jid] = Job(id=jid, url=req.url)
+async def create_job(payload: dict, bg: BackgroundTasks):
+    url = payload.get("url")
+    if not url:
+        raise HTTPException(400, "url required")
+    jid = uuid.uuid4().hex
+    JOBS[jid] = Job(id=jid, url=url)
     bg.add_task(_run_job, jid)
     return {"job_id": jid, "status": JOBS[jid].status}
 
@@ -92,23 +88,19 @@ async def get_file(job_id: str):
         raise HTTPException(404, "file not ready")
     return FileResponse(job.file_path, filename=Path(job.file_path).name, media_type="video/mp4")
 
-# تنظيف تلقائي قديم
 async def _janitor():
     while True:
         now = time.time()
         for j in list(JOBS.values()):
             if j.done_at and (now - j.done_at) > CLEANUP_AFTER_DONE:
-                try:
-                    p = Path(j.file_path or "")
-                    if p.exists():
-                        p.unlink(missing_ok=True)
-                    d = Path(STORAGE_DIR / j.id)
-                    if d.exists():
-                        for x in d.iterdir():
-                            x.unlink(missing_ok=True)
-                        d.rmdir()
-                except Exception:
-                    pass
+                p = Path(j.file_path or "")
+                if p.exists():
+                    p.unlink(missing_ok=True)
+                d = Path(STORAGE_DIR / j.id)
+                if d.exists():
+                    for x in d.iterdir():
+                        x.unlink(missing_ok=True)
+                    d.rmdir()
                 JOBS.pop(j.id, None)
         await asyncio.sleep(60)
 
@@ -116,7 +108,6 @@ async def _janitor():
 async def _startup():
     asyncio.create_task(_janitor())
 
-# تشغيل محلي (اختياري)
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
+    import uvicorn, os
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), reload=False)
