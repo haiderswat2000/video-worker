@@ -1,8 +1,11 @@
 # ytdl_helper.py
 # -*- coding: utf-8 -*-
-import os, re, shutil, tempfile
+import os
+import re
+import shutil
+import tempfile
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 from yt_dlp import YoutubeDL
 
 UA = (
@@ -11,10 +14,10 @@ UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# نبحث عن الكوكيز في هذه المسارات
-CANDIDATE_YT_COOKIES = [Path("./cookies/youtube.txt"), Path("./youtube.txt")]
+# أين نبحث عن ملف كوكيز يوتيوب
+CANDIDATE_YT_COOKIES: List[Path] = [Path("./cookies/youtube.txt"), Path("./youtube.txt")]
 
-def _pick_cookiefile() -> Path | None:
+def _pick_cookiefile() -> Optional[Path]:
     for p in CANDIDATE_YT_COOKIES:
         if p.exists() and p.is_file():
             return p
@@ -38,21 +41,11 @@ def _sanitize(s: str) -> str:
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
-# --------- توليد كوكيز Netscape موسّعة (يوتيوب + جوجل) ----------
-NEEDED_NAMES = {
-    "__Secure-1PSID", "__Secure-3PSID",
-    "__Secure-1PSIDTS", "__Secure-3PSIDTS",
-    "__Secure-1PSIDCC", "__Secure-3PSIDCC",
-    "SAPISID", "APISID", "HSID", "SSID", "SID",
-    "__Secure-1PAPISID", "__Secure-3PAPISID",
-    "LOGIN_INFO", "YSC", "VISITOR_INFO1_LIVE", "PREF", "GPS",
-    "CONSENT",
-}
-
+# ---------- توليد كوكيز Netscape موسّعة (يوتيوب + جوجل) ----------
 def _parse_netscape_lines(text: str) -> List[tuple]:
     rows = []
     for line in text.splitlines():
-        if not line or line.startswith("#"):  # تجاهل التعليقات
+        if not line or line.startswith("#"):
             continue
         parts = line.split("\t")
         if len(parts) >= 7:
@@ -60,48 +53,47 @@ def _parse_netscape_lines(text: str) -> List[tuple]:
             rows.append((domain, flag, path, secure, expires, name, value))
     return rows
 
-def _write_netscape_file(rows: List[tuple], dest: Path):
-    lines = [
+def _write_netscape_file(rows: List[tuple], dest: Path) -> None:
+    header = [
         "# Netscape HTTP Cookie File",
         "# Generated/merged by worker",
         ""
     ]
-    for (domain, flag, path, secure, expires, name, value) in rows:
-        lines.append("\t".join([domain, flag, path, secure, str(expires), name, value]))
-    dest.write_text("\n".join(lines), encoding="utf-8")
+    lines = ["\t".join([domain, flag, path, secure, str(expires), name, value])
+             for (domain, flag, path, secure, expires, name, value) in rows]
+    dest.write_text("\n".join(header + lines), encoding="utf-8")
 
 def _ensure_consent_and_google_mirror(orig: Path) -> str:
     """
-    يقرأ youtube.txt ويُنتج ملف مؤقت:
+    يقرأ youtube.txt ويُنتج ملفاً مؤقتاً:
+      - يزيل بادئة '#HttpOnly_' من الدومين إن وجدت
       - يضيف CONSENT=YES+ إن لم توجد
-      - ينسخ كل الكوكيز لكلٍ من .youtube.com و .google.com
+      - يضاعف كل كوكيز إلى .google.com بالإضافة إلى .youtube.com
     """
     txt = orig.read_text(encoding="utf-8", errors="ignore")
     rows = _parse_netscape_lines(txt)
 
-    # هل لدينا CONSENT؟
-    have_consent = any(name == "CONSENT" for *_rest, name, _ in rows)
+    # كشف وجود CONSENT
+    have_consent = any((row[5] == "CONSENT") for row in rows)
 
     merged: List[tuple] = []
     for (domain, flag, path, secure, expires, name, value) in rows:
-        # تنظيف التعليقات التي كان فيها "#HttpOnly_"
-        domain = domain.lstrip("#")
-        # نسخ السطر كما هو
+        domain = domain.lstrip("#")  # معالجة '#HttpOnly_.youtube.com'
         merged.append((domain, flag, path, secure, expires, name, value))
-        # مضاعفة لأي كوكي إلى google.com إن كان أصله youtube.com
-        if domain.endswith("youtube.com"):
+        # مضاعفة لأي كوكي إلى google.com إذا كان من youtube.com (يشمل HttpOnly السابق)
+        if "youtube.com" in domain:
             merged.append((".google.com", "TRUE", "/", "TRUE", expires, name, value))
 
     if not have_consent:
-        # أضف CONSENT=YES+ إلى كلا النطاقين (يدوم حتى 2099)
-        for dom in [".youtube.com", ".google.com"]:
+        # صلاحية طويلة (4102444800 ≈ 2099-12-31)
+        for dom in (".youtube.com", ".google.com"):
             merged.append((dom, "TRUE", "/", "TRUE", "4102444800", "CONSENT", "YES+"))
 
     tmp = Path(tempfile.gettempdir()) / f"yt_cookies_merged_{os.getpid()}.txt"
     _write_netscape_file(merged, tmp)
     return str(tmp)
 
-# --------- yt-dlp options ----------
+# ---------- إعدادات yt-dlp ----------
 def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[str, Any]:
     base: Dict[str, Any] = {
         "outtmpl": outtmpl,
@@ -116,7 +108,7 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
         "concurrent_fragment_downloads": 4,
         "geo_bypass": True,
         "cachedir": False,
-        # تفضيلات للمخرجات
+        # تفضيل mp4/h264 وتجنّب HLS قدر الإمكان
         "format_sort": [
             "+res", "+br",
             "codec:h264", "acodec:aac",
@@ -133,7 +125,7 @@ def _base_opts(outtmpl: str, progress_hook, url_for_cookies: str = "") -> Dict[s
 
     return base
 
-def _probe_info(url: str, base_opts: Dict[str, Any]) -> Dict[str, Any]:
+def probe_info(url: str, base_opts: Dict[str, Any]) -> Dict[str, Any]:
     opts = dict(base_opts)
     opts.pop("format", None)
     opts.pop("merge_output_format", None)
@@ -143,21 +135,28 @@ def _probe_info(url: str, base_opts: Dict[str, Any]) -> Dict[str, Any]:
             info = info["entries"][0]
     return info or {}
 
-def _pick_best_muxed(info: Dict[str, Any]) -> str | None:
+def _pick_best_muxed(info: Dict[str, Any]) -> Optional[str]:
+    """
+    اختيار أفضل صيغة 'muxed' (صوت+فيديو معًا) ويفضّل MP4 ويتجنب HLS.
+    """
     fmts: List[Dict[str, Any]] = info.get("formats") or []
+
     def is_muxed(f: Dict[str, Any]) -> bool:
         ac = (f.get("acodec") or "").lower()
         vc = (f.get("vcodec") or "").lower()
         return ac not in ("", "none") and vc not in ("", "none")
-    cand = []
+
+    cand: List[tuple] = []
     for f in fmts:
         if not is_muxed(f):
             continue
         proto = (f.get("protocol") or "").lower()
         is_hls = proto.startswith("m3u8") or "hls" in proto
         cand.append((f, is_hls))
+
     if not cand:
         return None
+
     def score(pair):
         f, is_hls = pair
         ext = (f.get("ext") or "").lower()
@@ -166,47 +165,52 @@ def _pick_best_muxed(info: Dict[str, Any]) -> str | None:
         mp4_bonus = 100000 if ext == "mp4" else 0
         hls_penalty = -50000 if is_hls else 0
         return (mp4_bonus + hls_penalty, h, tbr)
+
     best_f, _ = sorted(cand, key=score, reverse=True)[0]
     return best_f.get("format_id")
 
+# ---------- التنزيل ----------
 def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
     """
     يحاول أولاً صيغة مدمجة جاهزة، ثم سلاسل fallback، ثم الدمج عبر FFmpeg إن كان متوفراً.
-    كما يدمج/يكمّل الكوكيز تلقائياً لتخطّي رسالة "Sign in to confirm".
+    كما يدمج/يكمّل الكوكيز تلقائياً لتخطي "Sign in to confirm".
     """
     os.makedirs(out_dir, exist_ok=True)
     tmp_out = os.path.join(out_dir, "%(title).100s.%(ext)s")
     base_opts = _base_opts(tmp_out, lambda _p: None, url_for_cookies=url)
     ff_ok = _ffmpeg_available()
 
-    info = _probe_info(url, base_opts)
+    info = probe_info(url, base_opts)
     fmt_id = _pick_best_muxed(info)
 
     try_order: List[Dict[str, Any]] = []
 
     # 1) format_id المدمج إن وجد
     if fmt_id:
-        o1 = dict(base_opts); o1["format"] = fmt_id
+        o1 = dict(base_opts)
+        o1["format"] = fmt_id
         try_order.append(o1)
 
     # 2) بدون دمج: أي صيغة فيها صوت
-    o2 = dict(base_opts); o2["format"] = "best[hasaudio=true][ext=mp4]/best[hasaudio=true]/best"
+    o2 = dict(base_opts)
+    o2["format"] = "best[hasaudio=true][ext=mp4]/best[hasaudio=true]/best"
     try_order.append(o2)
 
-    # 3) مع FFmpeg: دمج فيديو+صوت وإخراج mp4
+    # 3) مع FFmpeg: دمج أفضل فيديو+صوت وإخراج mp4
     if ff_ok:
         o3 = dict(base_opts)
         o3["format"] = "bestvideo*+bestaudio/best"
         o3["merge_output_format"] = "mp4"
         try_order.append(o3)
 
-    # 4) أخيرًا best
-    o4 = dict(base_opts); o4["format"] = "best"
+    # 4) أخيرًا: best
+    o4 = dict(base_opts)
+    o4["format"] = "best"
     try_order.append(o4)
 
-    last_exc = None
-    final_path = None
-    final_info = None
+    last_exc: Optional[Exception] = None
+    final_path: Optional[str] = None
+    final_info: Optional[Dict[str, Any]] = None
 
     for opts in try_order:
         try:
@@ -221,7 +225,7 @@ def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
     if not final_path:
         raise last_exc or RuntimeError("failed to download")
 
-    # إعادة تسمية إلى .mp4 (حتى لو الأصل webm)
+    # فرض اسم نظيف .mp4 (حتى لو خرج webm)
     base_name = _sanitize(os.path.splitext(os.path.basename(final_path))[0]) + ".mp4"
     dest = os.path.join(out_dir, base_name)
     if os.path.abspath(final_path) != os.path.abspath(dest):
@@ -230,4 +234,4 @@ def download(url: str, out_dir: str) -> Tuple[str, Dict[str, Any]]:
         except Exception:
             dest = final_path
 
-    return dest, final_info
+    return dest, final_info or {}
