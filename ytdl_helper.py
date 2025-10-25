@@ -41,14 +41,34 @@ def _ffmpeg_available() -> bool:
 
 # ---------- توليد كوكيز Netscape موسّعة (يوتيوب + جوجل) ----------
 def _parse_netscape_lines(text: str) -> List[tuple]:
+    """
+    نفكّ أسطر Netscape بما فيها التي تبدأ بـ #HttpOnly_.youtube.com
+    ونحوّل الدومين لشكله الصحيح.
+    """
     rows = []
     for line in text.splitlines():
-        if not line or line.startswith("#"):
+        if not line:
             continue
         parts = line.split("\t")
         if len(parts) >= 7:
-            domain, flag, path, secure, expires, name, value = parts[:7]
-            rows.append((domain.lstrip("#"), flag, path, secure, expires, name, value))
+            domain_raw, flag, path, secure, expires, name, value = parts[:7]
+            domain = domain_raw.strip()
+
+            # ✅ إصلاح مهم: إزالة بادئة "#HttpOnly_" بشكل صحيح
+            if domain.startswith("#HttpOnly_."):
+                # "#HttpOnly_.youtube.com" -> ".youtube.com"
+                domain = "." + domain[len("#HttpOnly_."):]
+            elif domain.startswith("#HttpOnly_"):
+                # "#HttpOnly_youtube.com" -> "youtube.com"
+                domain = domain[len("#HttpOnly_"):]
+            elif domain.startswith("#."):
+                # "#.youtube.com" -> ".youtube.com"
+                domain = domain[1:]
+            elif domain.startswith("#"):
+                # "#youtube.com" -> "youtube.com"
+                domain = domain[1:]
+
+            rows.append((domain, flag, path, secure, expires, name, value))
     return rows
 
 def _write_netscape_file(rows: List[tuple], dest: Path) -> None:
@@ -59,7 +79,7 @@ def _write_netscape_file(rows: List[tuple], dest: Path) -> None:
 def _ensure_consent_and_google_mirror(orig: Path) -> str:
     """
     يقرأ youtube.txt ويُنتج ملفًا مؤقتًا:
-      - يزيل '#HttpOnly_' إن وُجدت
+      - يصلّح "#HttpOnly_" للدومين
       - يضيف CONSENT=YES+ إن كانت مفقودة
       - ينسخ كل الكوكيز أيضًا إلى .google.com
     """
