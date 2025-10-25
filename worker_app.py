@@ -15,7 +15,7 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 FILES_DIR = os.path.abspath("./_worker_files")
 os.makedirs(FILES_DIR, exist_ok=True)
 
-# ——— سياسة: نحول دائماً فيديوهات (audio=False) لتوافق كامل مع موبايل ———
+# ——— سياسة افتراضية: نحول دائماً فيديوهات (audio=False) ———
 ALWAYS_TRANSCODE = True
 if os.getenv("ALWAYS_TRANSCODE", "").lower() in ("0", "false", "no"):
     ALWAYS_TRANSCODE = False
@@ -28,14 +28,55 @@ async def _run(*cmd: str) -> Tuple[int, str, str]:
     out_b, err_b = await proc.communicate()
     return proc.returncode, out_b.decode("utf-8", "ignore"), err_b.decode("utf-8", "ignore")
 
-# تحويلة توافق تليجرام موبايل (قسرية)
+# ——— عمليات ffmpeg/ffprobe ———
+async def _probe_ok_for_mobile(path: str) -> bool:
+    """تحقق سريع: h264 + yuv420p + aac وامتداد mp4."""
+    if not path.lower().endswith(".mp4"):
+        return False
+    rc1, out1, _ = await _run(
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,pix_fmt",
+        "-of", "default=nw=1", path
+    )
+    rc2, out2, _ = await _run(
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=nw=1", path
+    )
+    if rc1 != 0:
+        return False
+    vcodec = ""
+    pixfmt = ""
+    for line in out1.splitlines():
+        if "codec_name=" in line:
+            vcodec = line.split("=", 1)[1].strip().lower()
+        elif "pix_fmt=" in line:
+            pixfmt = line.split("=", 1)[1].strip().lower()
+    acodec = ""
+    if rc2 == 0:
+        for line in out2.splitlines():
+            if "codec_name=" in line:
+                acodec = line.split("=", 1)[1].strip().lower()
+                break
+    v_ok = (vcodec == "h264") or ("avc" in vcodec)
+    a_ok = (acodec in ("", "aac"))  # قد لا يوجد صوت
+    pix_ok = (pixfmt in ("yuv420p", "nv12", ""))  # بعض المقاطع لا تُظهر pix_fmt
+    return v_ok and a_ok and pix_ok
+
+async def _faststart_remux(src: str, dst: str) -> None:
+    rc, _, err = await _run(
+        "ffmpeg", "-y", "-i", src,
+        "-movflags", "+faststart",
+        "-c", "copy",
+        dst
+    )
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg remux failed: {err[:4000]}")
+
+# تحويلة توافق تليجرام موبايل (صارمة)
 async def _make_h264_transcode_strict(src: str, dst: str) -> None:
-    # ملاحظات:
-    # - fps=30 + vsync=1 لتثبيت الفريمات (VFR -> CFR)
-    # - scale حتى 1080×1920 (يحافظ على النسبة) لمنع ملفات ضخمة أو غريبة
-    # - setpts/aresample لضبط الطوابع الزمنية
-    # - إزالة دوران الميتاداتا (rotate) لأن بعض اللاعبين على الهاتف يتعامل معها بشكل سيئ
-    # - keyint ثابت كل ~2s لسهولة السحب عبر الموبايل
+    # تثبيت الإطارات VFR->CFR، scale حتى 1080x1920 مع الحفاظ على النسبة،
+    # yuv420p، AAC 128k، موف إلى المقدمة، مفاتيح ثابتة، تصحيح الطوابع.
     vf = (
         "scale='min(1080,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,"
         "fps=30,format=yuv420p,setpts=PTS-STARTPTS"
@@ -82,7 +123,7 @@ async def run_ytdlp(url: str, *, want_audio: bool, cookies_txt: str | None, job_
     if want_audio:
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     else:
-        # نجبر إخراج mp4 قدر الإمكان؛ سنعيد الترميز على كل حال
+        # نطلب mp4 قدر الإمكان؛ سنُطبّع لاحقًا
         cmd += ["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
 
     rc, out, err = await _run(*cmd)
@@ -97,7 +138,8 @@ async def run_ytdlp(url: str, *, want_audio: bool, cookies_txt: str | None, job_
     produced = None
     for name in os.listdir(FILES_DIR):
         if name.startswith(job_id + "."):
-            produced = os.path.join(FILES_DIR, name); break
+            produced = os.path.join(FILES_DIR, name)
+            break
     if not produced or not os.path.isfile(produced):
         return {"ok": False, "error": "no output file produced"}
 
@@ -138,21 +180,34 @@ async def create_job(payload: Dict[str, Any]):
                 filename = os.path.basename(src_path)
                 JOBS[job_id] = {"status": "done", "filename": filename, "download_url": f"/files/{job_id}"}
             else:
-                # ✅ تحويلة صارمة دائماً أو حسب force_transcode
                 try:
                     norm_path = os.path.join(FILES_DIR, f"{job_id}.mp4")
-                    await _make_h264_transcode_strict(src_path, norm_path)
+                    if force_transcode:
+                        # تحويل قسري
+                        await _make_h264_transcode_strict(src_path, norm_path)
+                    else:
+                        # فحص سريع: إن كان مناسبًا نعمل remux(+faststart)، غير ذلك نُحوِّل
+                        ok_mobile = await _probe_ok_for_mobile(src_path)
+                        if ok_mobile:
+                            await _faststart_remux(src_path, norm_path)
+                        else:
+                            await _make_h264_transcode_strict(src_path, norm_path)
+
                     filename = os.path.basename(norm_path)
                     JOBS[job_id] = {"status": "done", "filename": filename, "download_url": f"/files/{job_id}"}
+
                     if os.path.abspath(src_path) != os.path.abspath(norm_path):
                         with contextlib.suppress(Exception):
                             os.remove(src_path)
+
                 except Exception as ex:
-                    # أخيرًا: أعد الملف الأصلي لو فشل التحويل (نادرًا)
+                    # أخيرًا: قدّم الملف الأصلي لو فشل التطبيع (نادرًا)
                     filename = os.path.basename(src_path)
                     JOBS[job_id] = {
-                        "status": "done", "filename": filename, "download_url": f"/files/{job_id}",
-                        "note": f"strict_transcode_failed:{str(ex)[:120]}",
+                        "status": "done",
+                        "filename": filename,
+                        "download_url": f"/files/{job_id}",
+                        "note": f"normalize_failed:{str(ex)[:120]}",
                     }
         except Exception as e:
             JOBS[job_id] = {"status": "error", "error": str(e)[:4000]}
